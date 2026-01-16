@@ -22,31 +22,61 @@ app = FastAPI(title="CallerGuard Backend")
 class Req(BaseModel):
     phone_number: str
 
+# Монгол кирилл үсэг шалгах функц
+def is_mongolian(text: str) -> bool:
+    # А-Я, а-я, зай
+    count = sum(1 for c in text if '\u0410' <= c <= '\u044F')
+    return count >= 2
+
+# Монгол текстийг салгаж авах
+def extract_mongolian_text(text: str) -> str:
+    return ''.join([c if '\u0410' <= c <= '\u044F' or c == ' ' else ' ' for c in text]).strip()
+
 @app.post("/analyze")
 def analyze(req: Req):
     phone = req.phone_number.strip().replace(" ", "").replace("-", "")
     local8 = phone[4:] if phone.startswith("+976") else phone
     query = f"\"{phone}\" OR \"{local8}\""
 
-    # 1) Google search via Serper
+    # 1️⃣ Google search via Serper
     serper_headers = {
         "X-API-KEY": SERPER_API_KEY,
         "Content-Type": "application/json",
     }
-    serper_body = {
-        "q": query,
-        "gl": "mn",
-        "hl": "mn"
-    }
+    serper_body = {"q": query, "gl": "mn", "hl": "mn"}
 
     s = requests.post(SERPER_URL, headers=serper_headers, json=serper_body, timeout=20)
     s.raise_for_status()
     serp = s.json()
 
-    organic = serp.get("organic", [])[:6]
-    people_also_ask = serp.get("peopleAlsoAsk", [])[:3]
+    # Organic үр дүнг шүүх
+    organic_all = serp.get("organic", [])
+    organic = [
+        r for r in organic_all
+        if r.get("snippet") and is_mongolian(r["snippet"])
+    ][:10]  # эхний 10 Монгол snippet
+    for r in organic:
+        r['snippet'] = extract_mongolian_text(r['snippet'])
 
-    # Олдсон мэдээллийг жагсаах
+    # People Also Ask үр дүнг шүүх
+    people_all = serp.get("peopleAlsoAsk", [])
+    people_also_ask = [
+        p for p in people_all
+        if p.get("snippet") and is_mongolian(p["snippet"])
+    ][:6]
+    for p in people_also_ask:
+        p['snippet'] = extract_mongolian_text(p['snippet'])
+
+    # Хэрвээ Монгол мэдээлэл олдоогүй бол шууд мэдэгдэл
+    if not organic and not people_also_ask:
+        return {
+            "phone_number": phone,
+            "summary": "Олон нийтэд ил мэдээлэл олдсонгүй, уг дугаарын үйл ажиллагааг тодорхойлох боломжгүй байна.",
+            "found_information": [],
+            "sources": []
+        }
+
+    # Мэдээллийг жагсаах
     found_info = []
     context_lines = []
 
@@ -68,46 +98,44 @@ def analyze(req: Req):
         found_info.append(item)
         context_lines.append(f"- {item['title']} | {item['snippet']}")
 
-    context = "\n".join(context_lines) if context_lines else "Олон нийтэд ил мэдээлэл олдсонгүй."
+    context = "\n".join(context_lines)
 
-    # 2) DeepSeek-ээр дүгнэлт гаргуулах (зөвхөн 2–3 өгүүлбэр)
-    ds_headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    # 2️⃣ DeepSeek prompt (зөвхөн олдсон snippet-г илгээх)
+    summary = "Олон нийтэд ил мэдээлэл олдсонгүй, уг дугаарын үйл ажиллагааг тодорхойлох боломжгүй байна."
+    if context:  # snippet байгаа үед л DeepSeek рүү явуулах
+        ds_headers = {
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json",
+        }
 
-    prompt = f"""
+        prompt = f"""
 Та бол утасны дугаарын талаарх мэдээллийг нэгтгэн дүгнэдэг туслах.
-
-Доорх хайлтын мэдээлэлд тулгуурлан:
-- ЯГ 2–3 өгүүлбэртэй
+- ЯГ 2–3 өгүүлбэртэй. Урт өгүүлбэр хэрэггүй товч тодорхой.
 - Монгол хэлээр
-- "энэ дугаар нь магадгүй ... төрлийн үйл ажиллагаа эрхэлдэг байж болох" гэсэн хэлбэрээр
-дүгнэлт гарга.
+- "энэ дугаарын эзэн иймэрхүү зүйлс цахим сүлжээнд тавьсан учир ийм хүн байж магадгүй" гэсэн хэлбэрээр дүгнэлт гарга.
 
 Хэрвээ мэдээлэл хангалтгүй бол:
 "Олон нийтэд ил мэдээлэл олдсонгүй, уг дугаарын үйл ажиллагааг тодорхойлох боломжгүй байна." гэж бич.
 
-Хайлтаас олдсон мэдээлэл:
+Хайлтын snippet-үүд:
 {context}
 """.strip()
 
-    ds_body = {
-        "model": "deepseek-chat",
-        "messages": [
-            {"role": "user", "content": prompt},
-        ],
-        "max_tokens": 200,
-        "stream": False,
-    }
+        ds_body = {
+            "model": "deepseek-chat",
+            "messages": [
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": 200,
+            "stream": False,
+        }
 
-    d = requests.post(DEEPSEEK_URL, headers=ds_headers, json=ds_body, timeout=25)
-    d.raise_for_status()
-    ds = d.json()
+        d = requests.post(DEEPSEEK_URL, headers=ds_headers, json=ds_body, timeout=25)
+        d.raise_for_status()
+        ds = d.json()
 
-    summary = ds["choices"][0]["message"]["content"].strip()
+        summary = ds["choices"][0]["message"]["content"].strip()
 
-    # Эх сурвалжууд
     sources = [r.get("link") for r in organic if r.get("link")]
 
     return {
