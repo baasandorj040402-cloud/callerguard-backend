@@ -12,7 +12,7 @@ SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
 if not SERPER_API_KEY or not DEEPSEEK_API_KEY:
-    raise RuntimeError("Missing SERPER_API_KEY or DEEPSEEK_API_KEY")
+    raise RuntimeError("Missing SERPER_API_KEY or DEEPSEEK_API_KEY env vars")
 
 SERPER_URL = "https://google.serper.dev/search"
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
@@ -22,15 +22,16 @@ app = FastAPI(title="CallerGuard Backend")
 class Req(BaseModel):
     phone_number: str
 
-# Монгол кирилл үсэг шалгах функц
-def is_mongolian(text: str) -> bool:
-    # А-Я, а-я, зай
-    count = sum(1 for c in text if '\u0410' <= c <= '\u044F')
-    return count >= 2
+# 1️⃣ Хүчтэй Монгол шалгуур
+def is_strict_mongolian(text: str) -> bool:
+    """Snippet-д кирилл үсэг давамгай байх эсэхийг шалгана"""
+    mongolian_chars = sum(1 for c in text if '\u0400' <= c <= '\u04FF')  # Кирилл
+    alpha_chars = sum(1 for c in text if c.isalpha())
+    return alpha_chars > 0 and (mongolian_chars / alpha_chars) >= 0.7  # >=70% кирилл
 
-# Монгол текстийг салгаж авах
+# 2️⃣ Зөвхөн Монгол үсэг авах
 def extract_mongolian_text(text: str) -> str:
-    return ''.join([c if '\u0410' <= c <= '\u044F' or c == ' ' else ' ' for c in text]).strip()
+    return ''.join([c if '\u0400' <= c <= '\u04FF' or c == ' ' else ' ' for c in text]).strip()
 
 @app.post("/analyze")
 def analyze(req: Req):
@@ -38,7 +39,7 @@ def analyze(req: Req):
     local8 = phone[4:] if phone.startswith("+976") else phone
     query = f"\"{phone}\" OR \"{local8}\""
 
-    # 1️⃣ Google search via Serper
+    # Google search via Serper
     serper_headers = {
         "X-API-KEY": SERPER_API_KEY,
         "Content-Type": "application/json",
@@ -53,8 +54,8 @@ def analyze(req: Req):
     organic_all = serp.get("organic", [])
     organic = [
         r for r in organic_all
-        if r.get("snippet") and is_mongolian(r["snippet"])
-    ][:10]  # эхний 10 Монгол snippet
+        if r.get("snippet") and is_strict_mongolian(r["snippet"])
+    ][:10]  # эхний 10 snippet
     for r in organic:
         r['snippet'] = extract_mongolian_text(r['snippet'])
 
@@ -62,7 +63,7 @@ def analyze(req: Req):
     people_all = serp.get("peopleAlsoAsk", [])
     people_also_ask = [
         p for p in people_all
-        if p.get("snippet") and is_mongolian(p["snippet"])
+        if p.get("snippet") and is_strict_mongolian(p["snippet"])
     ][:6]
     for p in people_also_ask:
         p['snippet'] = extract_mongolian_text(p['snippet'])
